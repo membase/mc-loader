@@ -2,6 +2,11 @@
 #include <string.h>
 #include <libmemcached/memcached.h>
 
+memcached_st *memc;
+
+bool doSet(char* key, size_t nkey, char* data, size_t size, int oom_error_code);
+bool doGet(char* key, size_t nkey, char* data, size_t size, uint32_t *flags);
+
 typedef enum {
   MCLOADER_SUCCESS = 0,
   MCLOADER_MCFAIL  = 1,
@@ -23,7 +28,6 @@ static int parse_host(char *hostport, char **hostname, int *port) {
   } else {
     *port = 11211;
   }
-
   return 0;
 }
 
@@ -41,12 +45,10 @@ static int parse_auth(char *auth, char **username, char **password) {
   } else {
     *password = strdup("");
   }
-
   return 0;
 }
 
 int main(int argc, char **argv) {
-
   char *hostname;
   int port;
   char *filename;
@@ -57,23 +59,17 @@ int main(int argc, char **argv) {
   char *sasl_password;
   int i;
   int j;
-  memcached_st *memc;
+
   char *buffer = malloc(sizeof(char) * 64);
   char *key = NULL;
   size_t nkey = 0;
   char *data = NULL;
   size_t size = 0;
-  char *rdata = NULL;
-  size_t rsize = 0;
   char *ptr = NULL;
   uint32_t flags;
-  memcached_return_t rc;
-  bool pass;
-  int rval = 0;
   FILE *file;
   char *fixed_data = NULL;
   int fixed_datasize = 0;
-  int backoff_us = 0;
   int fails = 0;
   int passes = 0;
   int oom_error_code = 10;
@@ -174,74 +170,19 @@ int main(int argc, char **argv) {
     size = strlen(data);
 
     if (check == false) {
-      /* if we fail to set, backoff then try again up to a 10 second backoff */
-      do {
-        rc = memcached_set(memc, key, nkey, data, size, 0, 0);
-        /* only backoff on temp mem errors */
-        if (rc == oom_error_code) {
-          backoff_us += 10000 + (backoff_us/20);
-          if (backoff_us > 4000000) {
-            backoff_us = 4000000;
-          }
-#ifdef VERBOSE
-          fprintf(stderr, "backing off %s, %d us due to error: %d\n", key, backoff_us, rc);
-#endif
-          usleep(backoff_us);
-        }
-      } while ((rc == oom_error_code) && (backoff_us < 4000000));
-      if (rc != MEMCACHED_SUCCESS) {
-        rval = 1;
-        fails ++;
-        fprintf(stderr, "Failed to set: %s, due to error: %d\n", key, rc);
+      if (doSet(key, nkey, data, size, oom_error_code)) {
+	passes++;
       } else {
-        passes ++;
+	fails++;
       }
-      backoff_us -= (10000 + (backoff_us/20));
-      if (backoff_us < 0) {
-        backoff_us = 0;
-      }
-#ifdef VERBOSE
-      if (backoff_us > 0) {
-        fprintf(stderr, "backoff: %d us\n", backoff_us);
-      }
-#endif
     } else {
-      rdata = memcached_get(memc, key, nkey, &rsize, &flags, &rc);
-      err_reason = MCLOADER_SUCCESS;
-      pass = true;
-      if (rc != MEMCACHED_SUCCESS) {
-        pass = false;
-        err_reason = MCLOADER_MCFAIL;
-      } else if (rsize != size) {
-        pass = false;
-        err_reason = MCLOADER_SIZEDIF;
-      } else if (memcmp(data, rdata, size) != 0) {
-        pass = false;
-        err_reason = MCLOADER_DATADIF;
-      }
-      if (pass == false) {
-        rval = 1;
-        fails ++;
-        switch (err_reason) {
-        case MCLOADER_MCFAIL:
-          fprintf(stderr, "Failed to get: %s, memcached failure %d\n", key, rc);
-          break;
-        case MCLOADER_SIZEDIF:
-            fprintf(stderr, "Failed to get: %s, data size difference. expected %lu, got %lu\n", key, size, rsize);
-          break;
-        case MCLOADER_DATADIF:
-          fprintf(stderr, "Failed to get: %s, data value difference\n", key);
-          break;
-        default:
-          fprintf(stderr, "Failed to get: %s, mcloader failure %d\n", key, err_reason);
-        }
+      if (doGet(key, nkey, data, size, &flags)) {
+	passes++;
       } else {
-        passes ++;
+	fails++;
       }
-      free(rdata);
     }
   }
-
   if (sasl) {
     memcached_destroy_sasl_auth_data(memc);
   }
@@ -249,5 +190,83 @@ int main(int argc, char **argv) {
   printf("pass: %d\n",passes);
   printf("fail: %d\n",fails);
 
-  return rval;
+  if (fails > 0)
+    return 1;
+  return 0;
+}
+
+bool doGet(char* key, size_t nkey, char* data, size_t size, uint32_t *flags) {
+  memcached_return_t rc;
+  size_t rsize = 0;
+  bool pass = false;
+  int err_reason = MCLOADER_SUCCESS;
+
+  char* rdata = memcached_get(memc, key, nkey, &rsize, flags, &rc);
+  err_reason = MCLOADER_SUCCESS;
+  pass = true;
+  if (rc != MEMCACHED_SUCCESS) {
+    pass = false;
+    err_reason = MCLOADER_MCFAIL;
+  } else if (rsize != size) {
+    pass = false;
+    err_reason = MCLOADER_SIZEDIF;
+  } else if (memcmp(data, rdata, size) != 0) {
+    pass = false;
+    err_reason = MCLOADER_DATADIF;
+  }
+  if (pass == false) {
+    switch (err_reason) {
+    case MCLOADER_MCFAIL:
+      fprintf(stderr, "Failed to get: %s, memcached failure %d\n", key, rc);
+      break;
+    case MCLOADER_SIZEDIF:
+      fprintf(stderr, "Failed to get: %s, data size difference. expected %lu, got %lu\n", key, size, rsize);
+      break;
+    case MCLOADER_DATADIF:
+      fprintf(stderr, "Failed to get: %s, data value difference\n", key);
+      break;
+    default:
+      fprintf(stderr, "Failed to get: %s, mcloader failure %d\n", key, err_reason);
+    }
+  }
+  free(rdata);
+  return pass;
+}
+
+bool doSet(char* key, size_t nkey, char* data, size_t size, int oom_error_code) {
+  memcached_return_t rc;
+  bool pass;
+  int backoff_us = 0;
+  // if we fail to set, backoff then try again up to a 10 second backoff
+  do {
+    rc = memcached_set(memc, key, nkey, data, size, 0, 0);
+    // only backoff on temp mem errors
+    if (rc == oom_error_code) {
+      backoff_us += 10000 + (backoff_us/20);
+      if (backoff_us > 4000000) {
+	backoff_us = 4000000;
+      }
+#ifdef VERBOSE
+      fprintf(stderr, "backing off %s, %d us due to error: %d\n", key, backoff_us, rc);
+#endif
+      usleep(backoff_us);
+    }
+  }
+  while ((rc == oom_error_code) && (backoff_us < 4000000));
+  if (rc != MEMCACHED_SUCCESS) {
+    pass = false;
+    fprintf(stderr, "Failed to set: %s, due to error: %d\n", key, rc);
+  } else {
+    pass = true;
+  }
+  backoff_us -= (10000 + (backoff_us/20));
+  if (backoff_us < 0) {
+    backoff_us = 0;
+  }
+#ifdef VERBOSE
+  if (backoff_us > 0) {
+    fprintf(stderr, "backoff: %d us\n", backoff_us);
+  }
+#endif
+  return pass;
 }
