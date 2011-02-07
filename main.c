@@ -2,17 +2,25 @@
 #include <string.h>
 #include <libmemcached/memcached.h>
 
-memcached_st *memc;
-
-bool doSet(char* key, size_t nkey, char* data, size_t size, int oom_error_code);
-bool doGet(char* key, size_t nkey, char* data, size_t size, uint32_t *flags);
-
 typedef enum {
   MCLOADER_SUCCESS = 0,
   MCLOADER_MCFAIL  = 1,
   MCLOADER_SIZEDIF = 2,
   MCLOADER_DATADIF = 3,
 } MCLOADER_ERROR_CODE;
+
+typedef struct {
+  char* key;
+  size_t nkey;
+  char* data;
+  size_t size;
+} KV;
+
+memcached_st* memc;
+
+bool doSet(KV* kv, int oom_error_code);
+bool doGet(KV* kv, uint32_t *flags);
+KV* getNextKV(FILE* file, char* fixed_data);
 
 /*
   convert hostname:port to char*:int
@@ -49,6 +57,7 @@ static int parse_auth(char *auth, char **username, char **password) {
 }
 
 int main(int argc, char **argv) {
+  KV* kv;
   char *hostname;
   int port;
   char *filename;
@@ -66,6 +75,7 @@ int main(int argc, char **argv) {
   char *data = NULL;
   size_t size = 0;
   char *ptr = NULL;
+
   uint32_t flags;
   FILE *file;
   char *fixed_data = NULL;
@@ -73,7 +83,6 @@ int main(int argc, char **argv) {
   int fails = 0;
   int passes = 0;
   int oom_error_code = 10;
-  int err_reason = MCLOADER_SUCCESS;
 
   /* parse out arguments */
   if (argc < 3) {
@@ -150,43 +159,25 @@ int main(int argc, char **argv) {
     exit(1);
   }
 
-  /* read in keys and either set or get */
-  while (fgets(buffer,63,file) != NULL) {
-    key = buffer;
-    ptr = strchr(key, ' ');
-    if (ptr == NULL) {
-      continue;
-    }
-    *ptr = '\0';
-    data = ptr + 1;
-    ptr = strchr(data, '\n');
-    if (ptr != NULL) {
-      *ptr = '\0';
-    }
-    if (fixed_data != NULL) {
-      data = fixed_data;
-    }
-    nkey = strlen(key);
-    size = strlen(data);
-
+  while( (kv = getNextKV(file, fixed_data)) != NULL) {
     if (check == false) {
-      if (doSet(key, nkey, data, size, oom_error_code)) {
+      if (doSet(kv, oom_error_code)) {
 	passes++;
       } else {
 	fails++;
       }
     } else {
-      if (doGet(key, nkey, data, size, &flags)) {
+      if (doGet(kv, &flags)) {
 	passes++;
       } else {
 	fails++;
       }
     }
+    free(kv);
   }
   if (sasl) {
     memcached_destroy_sasl_auth_data(memc);
   }
-
   printf("pass: %d\n",passes);
   printf("fail: %d\n",fails);
 
@@ -195,51 +186,79 @@ int main(int argc, char **argv) {
   return 0;
 }
 
-bool doGet(char* key, size_t nkey, char* data, size_t size, uint32_t *flags) {
+KV* getNextKV(FILE* file, char* fixed_data) {
+  char *buffer = malloc(sizeof(char) * 64);
+  char *ptr = NULL;
+
+  KV* kv = (KV*) malloc(sizeof(KV));
+  if (fgets(buffer,63,file) != NULL) {
+    kv->key = strdup(buffer);
+    ptr = strchr(kv->key, ' ');
+    if (ptr == NULL) {
+      return NULL;
+    }
+    *ptr = '\0';
+    kv->data = ptr + 1;
+    ptr = strchr(kv->data, '\n');
+    if (ptr != NULL) {
+      *ptr = '\0';
+    }
+    if (fixed_data != NULL) {
+      kv->data = fixed_data;
+    }
+    kv->nkey = strlen(kv->key);
+    kv->size = strlen(kv->data);
+    return kv;
+  } else {
+    return NULL;
+  }
+}
+
+bool doGet(KV* kv, uint32_t *flags) {
   memcached_return_t rc;
   size_t rsize = 0;
   bool pass = false;
   int err_reason = MCLOADER_SUCCESS;
 
-  char* rdata = memcached_get(memc, key, nkey, &rsize, flags, &rc);
+  char* rdata = memcached_get(memc, kv->key, kv->nkey, &rsize, flags, &rc);
   err_reason = MCLOADER_SUCCESS;
   pass = true;
   if (rc != MEMCACHED_SUCCESS) {
     pass = false;
     err_reason = MCLOADER_MCFAIL;
-  } else if (rsize != size) {
+  } else if (rsize != kv->size) {
     pass = false;
     err_reason = MCLOADER_SIZEDIF;
-  } else if (memcmp(data, rdata, size) != 0) {
+  } else if (memcmp(kv->data, rdata, kv->size) != 0) {
     pass = false;
     err_reason = MCLOADER_DATADIF;
   }
   if (pass == false) {
     switch (err_reason) {
     case MCLOADER_MCFAIL:
-      fprintf(stderr, "Failed to get: %s, memcached failure %d\n", key, rc);
+      fprintf(stderr, "Failed to get: %s, memcached failure %d\n", kv->key, rc);
       break;
     case MCLOADER_SIZEDIF:
-      fprintf(stderr, "Failed to get: %s, data size difference. expected %lu, got %lu\n", key, size, rsize);
+      fprintf(stderr, "Failed to get: %s, data size difference. expected %lu, got %lu\n", kv->key, kv->size, rsize);
       break;
     case MCLOADER_DATADIF:
-      fprintf(stderr, "Failed to get: %s, data value difference\n", key);
+      fprintf(stderr, "Failed to get: %s, data value difference\n", kv->key);
       break;
     default:
-      fprintf(stderr, "Failed to get: %s, mcloader failure %d\n", key, err_reason);
+      fprintf(stderr, "Failed to get: %s, mcloader failure %d\n", kv->key, err_reason);
     }
   }
   free(rdata);
   return pass;
 }
 
-bool doSet(char* key, size_t nkey, char* data, size_t size, int oom_error_code) {
+bool doSet(KV* kv, int oom_error_code) {
   memcached_return_t rc;
   bool pass;
   int backoff_us = 0;
   // if we fail to set, backoff then try again up to a 10 second backoff
   do {
-    rc = memcached_set(memc, key, nkey, data, size, 0, 0);
+    rc = memcached_set(memc, kv->key, kv->nkey, kv->data, kv->size, 0, 0);
     // only backoff on temp mem errors
     if (rc == oom_error_code) {
       backoff_us += 10000 + (backoff_us/20);
@@ -247,7 +266,7 @@ bool doSet(char* key, size_t nkey, char* data, size_t size, int oom_error_code) 
 	backoff_us = 4000000;
       }
 #ifdef VERBOSE
-      fprintf(stderr, "backing off %s, %d us due to error: %d\n", key, backoff_us, rc);
+      fprintf(stderr, "backing off %s, %d us due to error: %d\n", kv->key, backoff_us, rc);
 #endif
       usleep(backoff_us);
     }
@@ -255,7 +274,7 @@ bool doSet(char* key, size_t nkey, char* data, size_t size, int oom_error_code) 
   while ((rc == oom_error_code) && (backoff_us < 4000000));
   if (rc != MEMCACHED_SUCCESS) {
     pass = false;
-    fprintf(stderr, "Failed to set: %s, due to error: %d\n", key, rc);
+    fprintf(stderr, "Failed to set: %s, due to error: %d\n", kv->key, rc);
   } else {
     pass = true;
   }
