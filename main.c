@@ -16,10 +16,18 @@ typedef struct {
   size_t size;
 } KV;
 
+typedef struct {
+  char* hostname;
+  int port;
+  char* sasl_username;
+  char* sasl_password;
+} Credentials;
+
 memcached_st* memc;
 
 bool doSet(KV* kv, int oom_error_code);
 bool doGet(KV* kv, uint32_t *flags);
+void memcacheConnect(Credentials* credentials, bool binary);
 KV* getNextKV(FILE* file, char* fixed_data);
 
 /*
@@ -58,23 +66,12 @@ static int parse_auth(char *auth, char **username, char **password) {
 
 int main(int argc, char **argv) {
   KV* kv;
-  char *hostname;
-  int port;
+  Credentials* credentials = (Credentials*) malloc(sizeof(Credentials));
   char *filename;
   bool check = false;
   bool binary = false;
-  bool sasl = false;
-  char *sasl_username;
-  char *sasl_password;
   int i;
   int j;
-
-  char *buffer = malloc(sizeof(char) * 64);
-  char *key = NULL;
-  size_t nkey = 0;
-  char *data = NULL;
-  size_t size = 0;
-  char *ptr = NULL;
 
   uint32_t flags;
   FILE *file;
@@ -89,8 +86,8 @@ int main(int argc, char **argv) {
     printf("mc-loader <server>:<port> <keyset> [check] [binary] [valuesize size] [sasl username:password]\n");
     exit (1);
   }
-
-  parse_host(argv[1], &hostname, &port);
+  char* hostname;
+  parse_host(argv[1], &(credentials->hostname), &(credentials->port));
   filename = strdup(argv[2]);
 
   for (i=3; i < argc; i++) {
@@ -123,32 +120,13 @@ int main(int argc, char **argv) {
         fprintf(stderr, "Missing SASL username:password\n");
         exit(1);
       }
-      sasl = true;
       binary = true;
-      parse_auth(argv[i+1], &sasl_username, &sasl_password);
+      parse_auth(argv[i+1], &(credentials->sasl_username), &(credentials->sasl_password));
       i = i + 1;
     }
   }
-
-  /* connect to the memcached server */
-  memc = memcached_create(NULL);
-  memcached_behavior_set(memc, MEMCACHED_BEHAVIOR_NO_BLOCK, 1);
-  if (binary) {
-    memcached_behavior_set(memc, MEMCACHED_BEHAVIOR_BINARY_PROTOCOL, 1);
-  }
-  if (sasl) {
-    if (sasl_client_init(NULL) != SASL_OK) {
-      fprintf(stderr, "Failed to initialize sasl library!\n");
-      exit(1);
-    }
-
-    memc->sasl = malloc(sizeof(struct memcached_sasl_st));
-    memc->sasl->callbacks = NULL;
-    memc->sasl->is_allocated = false;
-    memcached_set_sasl_auth_data(memc, sasl_username, sasl_password);
-  }
-  memcached_server_add(memc, hostname, port);
-
+  memcacheConnect(credentials, binary);
+  
   if (strcmp(filename,"-") == 0) {
     file = stdin;
   } else {
@@ -175,7 +153,7 @@ int main(int argc, char **argv) {
     }
     free(kv);
   }
-  if (sasl) {
+  if (credentials->sasl_username != NULL && credentials->sasl_password != NULL) {
     memcached_destroy_sasl_auth_data(memc);
   }
   printf("pass: %d\n",passes);
@@ -184,6 +162,27 @@ int main(int argc, char **argv) {
   if (fails > 0)
     return 1;
   return 0;
+}
+
+void memcacheConnect(Credentials* credentials, bool binary) {
+  /* connect to the memcached server */
+  memc = memcached_create(NULL);
+  memcached_behavior_set(memc, MEMCACHED_BEHAVIOR_NO_BLOCK, 1);
+  if (binary) {
+    memcached_behavior_set(memc, MEMCACHED_BEHAVIOR_BINARY_PROTOCOL, 1);
+  }
+  if (credentials->sasl_username != NULL && credentials->sasl_password != NULL) {
+    if (sasl_client_init(NULL) != SASL_OK) {
+      fprintf(stderr, "Failed to initialize sasl library!\n");
+      exit(1);
+    }
+
+    memc->sasl = malloc(sizeof(struct memcached_sasl_st));
+    memc->sasl->callbacks = NULL;
+    memc->sasl->is_allocated = false;
+    memcached_set_sasl_auth_data(memc, credentials->sasl_username, credentials->sasl_password);
+  }
+  memcached_server_add(memc, credentials->hostname, credentials->port);
 }
 
 KV* getNextKV(FILE* file, char* fixed_data) {
