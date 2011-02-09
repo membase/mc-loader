@@ -23,11 +23,9 @@ typedef struct {
   char* sasl_password;
 } Credentials;
 
-memcached_st* memc;
-
-bool doSet(KV* kv, int oom_error_code);
-bool doGet(KV* kv, uint32_t *flags);
-void memcacheConnect(Credentials* credentials, bool binary);
+bool doSet(memcached_st* memc, KV* kv, int oom_error_code);
+bool doGet(memcached_st* memc, KV* kv, uint32_t *flags);
+memcached_st* memcacheConnect(Credentials* credentials, bool binary);
 KV* getNextKV(FILE* file, char* fixed_data);
 
 /*
@@ -65,6 +63,7 @@ static int parse_auth(char *auth, char **username, char **password) {
 }
 
 int main(int argc, char **argv) {
+  memcached_st* memc;
   KV* kv;
   Credentials* credentials = (Credentials*) malloc(sizeof(Credentials));
   char *filename;
@@ -125,8 +124,8 @@ int main(int argc, char **argv) {
       i = i + 1;
     }
   }
-  memcacheConnect(credentials, binary);
-  
+  memc = memcacheConnect(credentials, binary);
+
   if (strcmp(filename,"-") == 0) {
     file = stdin;
   } else {
@@ -139,13 +138,13 @@ int main(int argc, char **argv) {
 
   while( (kv = getNextKV(file, fixed_data)) != NULL) {
     if (check == false) {
-      if (doSet(kv, oom_error_code)) {
+      if (doSet(memc, kv, oom_error_code)) {
 	passes++;
       } else {
 	fails++;
       }
     } else {
-      if (doGet(kv, &flags)) {
+      if (doGet(memc, kv, &flags)) {
 	passes++;
       } else {
 	fails++;
@@ -164,9 +163,9 @@ int main(int argc, char **argv) {
   return 0;
 }
 
-void memcacheConnect(Credentials* credentials, bool binary) {
+memcached_st* memcacheConnect(Credentials* credentials, bool binary) {
   /* connect to the memcached server */
-  memc = memcached_create(NULL);
+  memcached_st* memc = memcached_create(NULL);
   memcached_behavior_set(memc, MEMCACHED_BEHAVIOR_NO_BLOCK, 1);
   if (binary) {
     memcached_behavior_set(memc, MEMCACHED_BEHAVIOR_BINARY_PROTOCOL, 1);
@@ -183,6 +182,7 @@ void memcacheConnect(Credentials* credentials, bool binary) {
     memcached_set_sasl_auth_data(memc, credentials->sasl_username, credentials->sasl_password);
   }
   memcached_server_add(memc, credentials->hostname, credentials->port);
+  return memc;
 }
 
 KV* getNextKV(FILE* file, char* fixed_data) {
@@ -213,7 +213,7 @@ KV* getNextKV(FILE* file, char* fixed_data) {
   }
 }
 
-bool doGet(KV* kv, uint32_t *flags) {
+bool doGet(memcached_st* memc, KV* kv, uint32_t *flags) {
   memcached_return_t rc;
   size_t rsize = 0;
   bool pass = false;
@@ -251,7 +251,7 @@ bool doGet(KV* kv, uint32_t *flags) {
   return pass;
 }
 
-bool doSet(KV* kv, int oom_error_code) {
+bool doSet(memcached_st* memc, KV* kv, int oom_error_code) {
   memcached_return_t rc;
   bool pass;
   int backoff_us = 0;
