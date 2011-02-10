@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <getopt.h>
 #include <string.h>
 #include <libmemcached/memcached.h>
 
@@ -27,114 +28,105 @@ bool doSet(memcached_st* memc, KV* kv, int oom_error_code);
 bool doGet(memcached_st* memc, KV* kv, uint32_t *flags);
 memcached_st* memcacheConnect(Credentials* credentials, bool binary);
 KV* getNextKV(FILE* file, char* fixed_data);
-
-/*
-  convert hostname:port to char*:int
-  if port is not specified then it defaults to 11211
-*/
-static int parse_host(char *hostport, char **hostname, int *port) {
-  char *ptr;
-  *hostname = strdup(hostport);
-  ptr = strchr(*hostname, ':');
-  if (ptr != NULL) {
-    *ptr = '\0';
-    *port = atoi(ptr + 1);
-  } else {
-    *port = 11211;
-  }
-  return 0;
-}
-
-/*
-  convert username:password to char*:char*
-  if password is not specified it defaults to ""
-*/
-static int parse_auth(char *auth, char **username, char **password) {
-  char *ptr;
-  *username = strdup(auth);
-  ptr = strchr(*username, ':');
-  if (ptr != NULL) {
-    *ptr = '\0';
-    *password = strdup(ptr + 1);
-  } else {
-    *password = strdup("");
-  }
-  return 0;
-}
+void usage(void);
 
 int main(int argc, char **argv) {
   memcached_st* memc;
   KV* kv;
   Credentials* credentials = (Credentials*) malloc(sizeof(Credentials));
-  char *filename;
   bool check = false;
   bool binary = false;
-  int i;
-  int j;
-
   uint32_t flags;
   FILE *file;
   char *fixed_data = NULL;
-  int fixed_datasize = 0;
   int fails = 0;
   int passes = 0;
   int oom_error_code = 10;
+  int threads = 1;
+  int i;
 
-  /* parse out arguments */
-  if (argc < 3) {
-    printf("mc-loader <server>:<port> <keyset> [check] [binary] [valuesize size] [sasl username:password]\n");
-    exit (1);
-  }
-  char* hostname;
-  parse_host(argv[1], &(credentials->hostname), &(credentials->port));
-  filename = strdup(argv[2]);
+  while (1) {
+    static struct option long_options[] = {
+      {"binary", no_argument, 0, 'b'},
+      {"check", no_argument, 0, 'c'},
+      {"help", no_argument, 0, 'i'},
+      {"hostname", required_argument, 0, 'h'},
+      {"keyset", required_argument, 0, 'k'},
+      {"password", required_argument, 0, 'P'},
+      {"port", required_argument, 0, 'p'},
+      {"threads", required_argument, 0, 't'},
+      {"username", required_argument, 0, 'u'},
+      {"valuesize", required_argument, 0, 'v'}
+    };
+    int c;
+    int option_index = 0;
+    c = getopt_long(argc, argv, "bch:k:p:P:t:u:s:", long_options, &option_index);
+    if (c == -1)
+      break;
 
-  for (i=3; i < argc; i++) {
-    if (strncmp("check", argv[i], 6) == 0) {
+    switch (c) {
+    case 'b':
+      binary = true;
+      break;
+    case 'c':
       check = true;
-    }
-    else if (strncmp("binary", argv[i], 7) == 0) {
+      break;
+    case 'h':
+      credentials->hostname = optarg;
+      if (credentials->port == 0)
+	credentials->port = 11211;
+      break;
+    case 'i':
+      usage();
+      exit(0);
+    case 'k':
+      if (strcmp(optarg,"-") == 0) {
+	file = stdin;
+      } else {
+	file = fopen(optarg, "r");
+      }
+      break;
+    case 'P':
+      credentials->sasl_password = optarg;
+      break;
+    case 'p':
+      credentials->port = atoi(optarg);
+      break;
+    case 's':
+      fixed_data = malloc(atoi(optarg)+1);
+      for (i = 0; i < atoi(optarg); i++) {
+	fixed_data[i]='a';
+      }
+      fixed_data[atoi(optarg)] = 0;
+      break;
+    case 't':
+      threads = atoi(optarg);
+      break;
+    case 'u':
+      credentials->sasl_username = optarg;
+      if (credentials->sasl_password == NULL)
+	credentials->sasl_password = strdup("");
       binary = true;
-      oom_error_code = 8;
-    }
-    else if (strncmp("valuesize", argv[i], 9) == 0) {
-      if (argc < (i+2)) {
-        fprintf(stderr, "Missing value size\n");
-        exit(1);
-      }
-      /* right now just fill the data with 'a', in the future
-         create a random (but predictable) set of data based
-         on the key and data specified in the file
-      */
-      fixed_datasize = atoi(argv[i+1]);
-      fixed_data = malloc(fixed_datasize+1);
-      for (j=0;j<fixed_datasize;j++) {
-        fixed_data[j]='a';
-      }
-      fixed_data[fixed_datasize] = 0;
-      i = i + 1;
-    }
-    else if (strncmp("sasl", argv[i], 4) == 0) {
-      if (argc < (i+2)) {
-        fprintf(stderr, "Missing SASL username:password\n");
-        exit(1);
-      }
-      binary = true;
-      parse_auth(argv[i+1], &(credentials->sasl_username), &(credentials->sasl_password));
-      i = i + 1;
-    }
+      break;
+    case '?':
+      break;
+    default:
+      abort();
+    } 
   }
-  memc = memcacheConnect(credentials, binary);
 
-  if (strcmp(filename,"-") == 0) {
-    file = stdin;
-  } else {
-    file = fopen(filename, "r");
-  }
-  if (file == NULL) {
-    fprintf(stderr, "Failed to open file %s\n", filename);
+  if (credentials->hostname == NULL) {
+    fprintf(stderr, "Hostname required\n");
+    usage();
     exit(1);
   }
+  if (file == NULL) {
+    fprintf(stderr, "Failed to open keyset\n");
+    usage();
+    exit(1);
+  }
+
+  memc = memcacheConnect(credentials, binary);
 
   while( (kv = getNextKV(file, fixed_data)) != NULL) {
     if (check == false) {
@@ -164,7 +156,6 @@ int main(int argc, char **argv) {
 }
 
 memcached_st* memcacheConnect(Credentials* credentials, bool binary) {
-  /* connect to the memcached server */
   memcached_st* memc = memcached_create(NULL);
   memcached_behavior_set(memc, MEMCACHED_BEHAVIOR_NO_BLOCK, 1);
   if (binary) {
@@ -175,7 +166,6 @@ memcached_st* memcacheConnect(Credentials* credentials, bool binary) {
       fprintf(stderr, "Failed to initialize sasl library!\n");
       exit(1);
     }
-
     memc->sasl = malloc(sizeof(struct memcached_sasl_st));
     memc->sasl->callbacks = NULL;
     memc->sasl->is_allocated = false;
@@ -188,8 +178,8 @@ memcached_st* memcacheConnect(Credentials* credentials, bool binary) {
 KV* getNextKV(FILE* file, char* fixed_data) {
   char *buffer = malloc(sizeof(char) * 64);
   char *ptr = NULL;
-
   KV* kv = (KV*) malloc(sizeof(KV));
+
   if (fgets(buffer,63,file) != NULL) {
     kv->key = strdup(buffer);
     ptr = strchr(kv->key, ' ');
@@ -287,4 +277,19 @@ bool doSet(memcached_st* memc, KV* kv, int oom_error_code) {
   }
 #endif
   return pass;
+}
+
+void usage(void) {
+  printf("-b,--binary\tSpecifies use of the binary protocol\n");
+  printf("-c,--check\tChecks key-value pairs in the host sever with key-value pairs in\n");
+  printf("\t\tthe specified keyset. If not specifed key-value pairs will be loaded\n");
+  printf("\t\tfrom the keyset into the host serer\n");
+  printf("-i,--help\tPrints help information\n");
+  printf("-h,--hostname\t(Required) Specifies the host to connect to\n");
+  printf("-k,--keyset\t(Required) Specifies a file containing keys\n");
+  printf("-P,--password\tSpecifies the password (only for sasl authentication\n");
+  printf("-p,--port\tThe port to use, default is 11211\n");
+  printf("-s,--valuesize\tThe size of the value for each key\n");
+  printf("-t,--threads\tThe number of threads to use\n");
+  printf("-u,--username\tSpecifies the username (only for SASL authentication)\n");
 }
