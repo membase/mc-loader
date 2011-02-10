@@ -24,10 +24,12 @@ typedef struct {
   char* sasl_password;
 } Credentials;
 
+FILE *file;
+
 bool doSet(memcached_st* memc, KV* kv, int oom_error_code);
 bool doGet(memcached_st* memc, KV* kv, uint32_t *flags);
 memcached_st* memcacheConnect(Credentials* credentials, bool binary);
-KV* getNextKV(FILE* file, char* fixed_data);
+KV* getNextKV(char* fixed_data);
 void usage(void);
 
 int main(int argc, char **argv) {
@@ -37,7 +39,6 @@ int main(int argc, char **argv) {
   bool check = false;
   bool binary = false;
   uint32_t flags;
-  FILE *file;
   char *fixed_data = NULL;
   int fails = 0;
   int passes = 0;
@@ -74,16 +75,16 @@ int main(int argc, char **argv) {
     case 'h':
       credentials->hostname = optarg;
       if (credentials->port == 0)
-	credentials->port = 11211;
+        credentials->port = 11211;
       break;
     case 'i':
       usage();
       exit(0);
     case 'k':
       if (strcmp(optarg,"-") == 0) {
-	file = stdin;
+        file = stdin;
       } else {
-	file = fopen(optarg, "r");
+        file = fopen(optarg, "r");
       }
       break;
     case 'P':
@@ -95,7 +96,7 @@ int main(int argc, char **argv) {
     case 's':
       fixed_data = malloc(atoi(optarg)+1);
       for (i = 0; i < atoi(optarg); i++) {
-	fixed_data[i]='a';
+        fixed_data[i]='a';
       }
       fixed_data[atoi(optarg)] = 0;
       break;
@@ -105,14 +106,14 @@ int main(int argc, char **argv) {
     case 'u':
       credentials->sasl_username = optarg;
       if (credentials->sasl_password == NULL)
-	credentials->sasl_password = strdup("");
+        credentials->sasl_password = strdup("");
       binary = true;
       break;
     case '?':
       break;
     default:
       abort();
-    } 
+    }
   }
 
   if (credentials->hostname == NULL) {
@@ -128,18 +129,18 @@ int main(int argc, char **argv) {
 
   memc = memcacheConnect(credentials, binary);
 
-  while( (kv = getNextKV(file, fixed_data)) != NULL) {
+  while( (kv = getNextKV(fixed_data)) != NULL) {
     if (check == false) {
       if (doSet(memc, kv, oom_error_code)) {
-	passes++;
+        passes++;
       } else {
-	fails++;
+        fails++;
       }
     } else {
       if (doGet(memc, kv, &flags)) {
-	passes++;
+        passes++;
       } else {
-	fails++;
+        fails++;
       }
     }
     free(kv);
@@ -175,7 +176,7 @@ memcached_st* memcacheConnect(Credentials* credentials, bool binary) {
   return memc;
 }
 
-KV* getNextKV(FILE* file, char* fixed_data) {
+KV* getNextKV(char* fixed_data) {
   char *buffer = malloc(sizeof(char) * 64);
   char *ptr = NULL;
   KV* kv = (KV*) malloc(sizeof(KV));
