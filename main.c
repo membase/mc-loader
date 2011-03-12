@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <getopt.h>
 #include <string.h>
+#include <pthread.h>
 #include <libmemcached/memcached.h>
 
 typedef enum {
@@ -25,26 +26,28 @@ typedef struct {
 } Credentials;
 
 FILE *file;
+pthread_mutex_t read_mutex;
+pthread_mutex_t pass_mutex;
+pthread_mutex_t fail_mutex;
+int fails = 0;
+int passes = 0;
+bool check = false;
+bool binary = false;
+char *fixed_data = NULL;
+Credentials* credentials;
+int oom_error_code = 10;
+int threads = 1;
+int i;
 
 bool doSet(memcached_st* memc, KV* kv, int oom_error_code);
 bool doGet(memcached_st* memc, KV* kv, uint32_t *flags);
 memcached_st* memcacheConnect(Credentials* credentials, bool binary);
 KV* getNextKV(char* fixed_data);
+void *workerThread(void* t);
 void usage(void);
 
 int main(int argc, char **argv) {
-  memcached_st* memc;
-  KV* kv;
-  Credentials* credentials = (Credentials*) malloc(sizeof(Credentials));
-  bool check = false;
-  bool binary = false;
-  uint32_t flags;
-  char *fixed_data = NULL;
-  int fails = 0;
-  int passes = 0;
-  int oom_error_code = 10;
-  int threads = 1;
-  int i;
+  credentials = (Credentials*) malloc(sizeof(Credentials));
 
   while (1) {
     static struct option long_options[] = {
@@ -127,20 +130,57 @@ int main(int argc, char **argv) {
     exit(1);
   }
 
-  memc = memcacheConnect(credentials, binary);
+  pthread_mutex_init(&pass_mutex, NULL);
+  pthread_mutex_init(&fail_mutex, NULL);
+  pthread_mutex_init(&read_mutex, NULL);
+
+  pthread_t thr[threads];
+  int rc;
+  long t;
+  void *status;
+  for(t = 0; t < threads; t++) {
+    rc = pthread_create(&thr[t], NULL, workerThread, (void *)t);
+    if (rc){
+      printf("ERROR; return code from pthread_create() is %d\n", rc);
+      exit(-1);
+    }
+  }
+   for (t = 0; t < threads; t++)
+     pthread_join(thr[t], &status);
+
+  printf("pass: %d\n",passes);
+  printf("fail: %d\n",fails);
+
+  if (fails > 0)
+    return 1;
+  return 0;
+}
+
+void *workerThread(void* t) {
+  KV* kv;
+  uint32_t flags;
+  memcached_st* memc = memcacheConnect(credentials, binary);
 
   while( (kv = getNextKV(fixed_data)) != NULL) {
     if (check == false) {
       if (doSet(memc, kv, oom_error_code)) {
+        pthread_mutex_lock(&pass_mutex);
         passes++;
+        pthread_mutex_unlock(&pass_mutex);
       } else {
+        pthread_mutex_lock(&fail_mutex);
         fails++;
+        pthread_mutex_unlock(&fail_mutex);
       }
     } else {
       if (doGet(memc, kv, &flags)) {
+        pthread_mutex_lock(&pass_mutex);
         passes++;
+        pthread_mutex_unlock(&pass_mutex);
       } else {
+        pthread_mutex_lock(&fail_mutex);
         fails++;
+        pthread_mutex_unlock(&fail_mutex);
       }
     }
     free(kv);
@@ -148,12 +188,6 @@ int main(int argc, char **argv) {
   if (credentials->sasl_username != NULL && credentials->sasl_password != NULL) {
     memcached_destroy_sasl_auth_data(memc);
   }
-  printf("pass: %d\n",passes);
-  printf("fail: %d\n",fails);
-
-  if (fails > 0)
-    return 1;
-  return 0;
 }
 
 memcached_st* memcacheConnect(Credentials* credentials, bool binary) {
@@ -181,7 +215,10 @@ KV* getNextKV(char* fixed_data) {
   char *ptr = NULL;
   KV* kv = (KV*) malloc(sizeof(KV));
 
-  if (fgets(buffer,63,file) != NULL) {
+  pthread_mutex_lock(&read_mutex);
+  char *read = fgets(buffer,63,file);
+  pthread_mutex_unlock(&read_mutex);
+  if (read != NULL) {
     kv->key = strdup(buffer);
     ptr = strchr(kv->key, ' ');
     if (ptr == NULL) {
@@ -253,7 +290,7 @@ bool doSet(memcached_st* memc, KV* kv, int oom_error_code) {
     if (rc == oom_error_code) {
       backoff_us += 10000 + (backoff_us/20);
       if (backoff_us > 4000000) {
-	backoff_us = 4000000;
+        backoff_us = 4000000;
       }
 #ifdef VERBOSE
       fprintf(stderr, "backing off %s, %d us due to error: %d\n", kv->key, backoff_us, rc);
